@@ -22,66 +22,14 @@ builds:
     flags:
       - "-tags={{ .Env.DATABASE }} {{ .Env.SOURCE }}"
       - "-trimpath"
-nfpms:
-  - homepage: "https://github.com/golang-migrate/migrate"
-    maintainer: "dhui@users.noreply.github.com"
-    license: MIT
-    description: "Database migrations"
-    formats:
-      - deb
-    file_name_template: "{{ .ProjectName }}.{{ .Os }}-{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
-dockers:
-  - goos: linux
-    goarch: amd64
-    dockerfile: Dockerfile.github-actions
-    use: buildx
-    ids:
-      - migrate
-    image_templates:
-      - 'migrate/migrate:{{ .Tag }}-amd64'
-    build_flag_templates:
-      - '--label=org.opencontainers.image.created={{ .Date }}'
-      - '--label=org.opencontainers.image.title={{ .ProjectName }}'
-      - '--label=org.opencontainers.image.revision={{ .FullCommit }}'
-      - '--label=org.opencontainers.image.version={{ .Version }}'
-      - "--label=org.opencontainers.image.source={{ .GitURL }}"
-      - "--platform=linux/amd64"
-  - goos: linux
-    goarch: arm64
-    dockerfile: Dockerfile.github-actions
-    use: buildx
-    ids:
-      - migrate
-    image_templates:
-      - 'migrate/migrate:{{ .Tag }}-arm64'
-    build_flag_templates:
-      - '--label=org.opencontainers.image.created={{ .Date }}'
-      - '--label=org.opencontainers.image.title={{ .ProjectName }}'
-      - '--label=org.opencontainers.image.revision={{ .FullCommit }}'
-      - '--label=org.opencontainers.image.version={{ .Version }}'
-      - "--label=org.opencontainers.image.source={{ .GitURL }}"
-      - "--platform=linux/arm64"
 
-docker_manifests:
-- name_template: 'migrate/migrate:{{ .Tag }}'
-  image_templates:
-  - 'migrate/migrate:{{ .Tag }}-amd64'
-  - 'migrate/migrate:{{ .Tag }}-arm64'
-- name_template: 'migrate/migrate:{{ .Major }}'
-  image_templates:
-  - 'migrate/migrate:{{ .Tag }}-amd64'
-  - 'migrate/migrate:{{ .Tag }}-arm64'
-- name_template: 'migrate/migrate:latest'
-  image_templates:
-  - 'migrate/migrate:{{ .Tag }}-amd64'
-  - 'migrate/migrate:{{ .Tag }}-arm64'
 archives:
   - name_template: "{{ .ProjectName }}.{{ .Os }}-{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
     format_overrides:
       - goos: windows
         format: zip
 checksum:
-  name_template: 'sha256sum.txt'
+  name_template: "sha256sum.txt"
 release:
   draft: true
   prerelease: auto
@@ -93,8 +41,8 @@ changelog:
   sort: asc
   filters:
     exclude:
-      - '^docs:'
-      - '^test:'
+      - "^docs:"
+      - "^test:"
       - Merge pull request
       - Merge branch
       - go mod tidy
