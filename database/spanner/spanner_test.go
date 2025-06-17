@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/golang-migrate/migrate/v4"
+	"github.com/ysmood/got"
 
 	dt "github.com/golang-migrate/migrate/v4/database/testing"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
@@ -57,4 +58,17 @@ func TestMigrate(t *testing.T) {
 		}
 		dt.TestMigrate(t, m)
 	})
+}
+
+func TestLock(t *testing.T) {
+	g := got.T(t)
+
+	s := &Spanner{}
+	d, err := s.Open("spanner://projects/music-devel/instances/capy-graph-db/databases/yad-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = d.Lock()
+	g.E(err)
 }

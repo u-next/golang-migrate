@@ -10,6 +10,7 @@ import (
 	nurl "net/url"
 	"regexp"
 	"strings"
+	"time"
 
 	"cloud.google.com/go/spanner"
 	sdb "cloud.google.com/go/spanner/admin/database/apiv1"
@@ -22,7 +23,6 @@ import (
 	adminpb "cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 	"github.com/hashicorp/go-multierror"
 	"github.com/samber/lo"
-	uatomic "go.uber.org/atomic"
 	"google.golang.org/api/iterator"
 )
 
@@ -33,11 +33,6 @@ func init() {
 
 // DefaultMigrationsTable is used if no custom table is specified
 const DefaultMigrationsTable = "SchemaMigrations"
-
-const (
-	unlockedVal = 0
-	lockedVal   = 1
-)
 
 // Driver errors
 var (
@@ -60,19 +55,26 @@ type Spanner struct {
 	db *DB
 
 	config *Config
-
-	lock *uatomic.Uint32
 }
 
 type DB struct {
 	admin *sdb.DatabaseAdminClient
 	data  *spanner.Client
+	lock  DistributedLock
 }
 
-func NewDB(admin sdb.DatabaseAdminClient, data spanner.Client) *DB {
+type Version struct {
+	Version  int
+	Dirty    bool
+	Checksum string
+	Lock     DistributedLock
+}
+
+func NewDB(admin *sdb.DatabaseAdminClient, data *spanner.Client) *DB {
 	return &DB{
-		admin: &admin,
-		data:  &data,
+		admin: admin,
+		data:  data,
+		lock:  newDistributedLock(),
 	}
 }
 
@@ -93,7 +95,6 @@ func WithInstance(instance *DB, config *Config) (database.Driver, error) {
 	sx := &Spanner{
 		db:     instance,
 		config: config,
-		lock:   uatomic.NewUint32(unlockedVal),
 	}
 
 	if err := sx.ensureVersionTable(); err != nil {
@@ -124,7 +125,8 @@ func (s *Spanner) Open(url string) (database.Driver, error) {
 
 	migrationsTable := purl.Query().Get("x-migrations-table")
 
-	db := &DB{admin: adminClient, data: dataClient}
+	db := NewDB(adminClient, dataClient)
+
 	return WithInstance(db, &Config{
 		DatabaseName:    dbname,
 		MigrationsTable: migrationsTable,
@@ -137,21 +139,58 @@ func (s *Spanner) Close() error {
 	return s.db.admin.Close()
 }
 
-// Lock implements database.Driver but doesn't do anything because Spanner only
-// enqueues the UpdateDatabaseDdlRequest.
+// Lock implements a common distributed lock for Spanner.
+// Wait until the lock is available. The lock will be available if not help by another process, or the TTL of the current lock has expired.
 func (s *Spanner) Lock() error {
-	if swapped := s.lock.CAS(unlockedVal, lockedVal); swapped {
-		return nil
+	// Get the row for the lock, if it exists.
+	ver, err := s.version()
+	if err != nil {
+		return &database.Error{OrigErr: err, Err: "failed to get current version"}
 	}
-	return ErrLockHeld
+
+	if ver == nil {
+		ver = &Version{
+			Version:  -1,
+			Dirty:    false,
+			Checksum: "",
+			Lock:     s.db.lock,
+		}
+	}
+
+	if ver.Lock == s.db.lock {
+		go func() {
+			tick := time.NewTicker(5 * time.Second)
+			defer tick.Stop()
+
+			for {
+
+			}
+		}()
+	}
+
+	expired := ver.Lock.Expired()
+
+	if expired {
+
+	}
+
+	_, err = s.db.data.ReadWriteTransaction(context.Background(), func(ctx context.Context, rwt *spanner.ReadWriteTransaction) error {
+		rwt.Update(ctx, spanner.Statement{
+			SQL: `INSERT INTO `,
+		})
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("%w failed to lock spanner db: %w", ErrLockHeld, err)
+	}
+
+	return nil
 }
 
 // Unlock implements database.Driver but no action required, see Lock.
 func (s *Spanner) Unlock() error {
-	if swapped := s.lock.CAS(lockedVal, unlockedVal); swapped {
-		return nil
-	}
-	return ErrLockNotHeld
+	return nil
 }
 
 // Run implements database.Driver
@@ -192,50 +231,28 @@ func (s *Spanner) Run(migration io.Reader) error {
 
 // SetVersion implements database.Driver
 func (s *Spanner) SetVersion(version int, dirty bool) error {
-	ctx := context.Background()
-
-	_, err := s.db.data.ReadWriteTransaction(ctx,
-		func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-			m := []*spanner.Mutation{
-				spanner.Delete(s.config.MigrationsTable, spanner.AllKeys()),
-				spanner.Insert(s.config.MigrationsTable,
-					[]string{"Version", "Dirty"},
-					[]interface{}{version, dirty},
-				)}
-			return txn.BufferWrite(m)
-		})
-	if err != nil {
-		return &database.Error{OrigErr: err}
-	}
+	s.setVersion(&Version{
+		Version:  version,
+		Dirty:    dirty,
+		Checksum: "",
+		Lock:     "",
+	})
 
 	return nil
 }
 
 // Version implements database.Driver
-func (s *Spanner) Version() (version int, dirty bool, err error) {
-	ctx := context.Background()
-
-	stmt := spanner.Statement{
-		SQL: `SELECT Version, Dirty FROM ` + s.config.MigrationsTable + ` LIMIT 1`,
+func (s *Spanner) Version() (int, bool, error) {
+	ver, err := s.version()
+	if err != nil {
+		return 0, false, &database.Error{OrigErr: err}
 	}
-	iter := s.db.data.Single().Query(ctx, stmt)
-	defer iter.Stop()
 
-	row, err := iter.Next()
-	switch err {
-	case iterator.Done:
+	if ver == nil || ver.Version < 0 {
 		return database.NilVersion, false, nil
-	case nil:
-		var v int64
-		if err = row.Columns(&v, &dirty); err != nil {
-			return 0, false, &database.Error{OrigErr: err, Query: []byte(stmt.SQL)}
-		}
-		version = int(v)
-	default:
-		return 0, false, &database.Error{OrigErr: err, Query: []byte(stmt.SQL)}
 	}
 
-	return version, dirty, nil
+	return ver.Version, ver.Dirty, nil
 }
 
 var nameMatcher = regexp.MustCompile(`(CREATE TABLE\s(\S+)\s)|(CREATE.+INDEX\s(\S+)\s)`)
@@ -312,8 +329,10 @@ func (s *Spanner) ensureVersionTable() (err error) {
 	}
 
 	stmt := fmt.Sprintf(`CREATE TABLE %s (
-    Version INT64 NOT NULL,
-    Dirty    BOOL NOT NULL
+		Version  INT64 NOT NULL,
+		Dirty    BOOL NOT NULL,
+		Checksum STRING(MAX),
+		Lock     STRING(MAX)
 	) PRIMARY KEY(Version)`, tbl)
 
 	op, err := s.db.admin.UpdateDatabaseDdl(ctx, &adminpb.UpdateDatabaseDdlRequest{
@@ -326,6 +345,51 @@ func (s *Spanner) ensureVersionTable() (err error) {
 	}
 	if err := op.Wait(ctx); err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(stmt)}
+	}
+
+	return nil
+}
+
+// return nil if not found
+func (s *Spanner) version() (*Version, error) {
+	ctx := context.Background()
+	stmt := spanner.Statement{
+		SQL: `SELECT Version, Dirty, Checksum, Lock FROM ` + s.config.MigrationsTable + ` LIMIT 1`,
+	}
+	iter := s.db.data.Single().Query(ctx, stmt)
+	defer iter.Stop()
+
+	row, err := iter.Next()
+	if err != nil {
+		if err == iterator.Done {
+			return nil, nil // No version found, return empty version
+		}
+		return nil, &database.Error{OrigErr: err, Query: []byte(stmt.SQL)}
+	}
+
+	var v Version
+	if err := row.Columns(&v.Version, &v.Dirty, &v.Checksum, &v.Lock); err != nil {
+		return nil, &database.Error{OrigErr: err, Query: []byte(stmt.SQL)}
+	}
+
+	return &v, nil
+}
+
+func (s *Spanner) setVersion(v *Version) error {
+	ctx := context.Background()
+
+	_, err := s.db.data.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		mutations := []*spanner.Mutation{
+			spanner.Delete(s.config.MigrationsTable, spanner.AllKeys()),
+			spanner.Insert(s.config.MigrationsTable,
+				[]string{"Version", "Dirty", "Checksum", "Lock"},
+				[]interface{}{v.Version, v.Dirty, v.Checksum, v.Lock}),
+		}
+		return txn.BufferWrite(mutations)
+	})
+
+	if err != nil {
+		return &database.Error{OrigErr: err}
 	}
 
 	return nil
